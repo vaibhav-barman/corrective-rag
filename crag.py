@@ -6,6 +6,7 @@ current LangChain / LangGraph / Pinecone / Tavily APIs.
 Usage:
     uv run crag.py ingest [--force] [--max-pages N] [--namespace NS]
     uv run crag.py ask "your question"
+    uv run crag.py eval
 """
 
 from __future__ import annotations
@@ -714,6 +715,41 @@ def print_result(result: dict) -> None:
     print("\nSources: " + (", ".join(result["sources"]) or "(none)"))
 
 
+# --- Small evaluation: one question per verdict -------------------------------
+
+EVAL_QUESTIONS: list[tuple[str, str]] = [
+    # Clearly answerable from the books
+    ("CORRECT", "What is a pandas DataFrame?"),
+    # Unrelated current event: nothing in the PDFs
+    ("INCORRECT", "Who won the 2026 FIFA World Cup final?"),
+    # Borderline: the Python book mentions versions, but not the current one
+    ("AMBIGUOUS", "What is the latest stable version of Python and when was it released?"),
+]
+
+
+def run_eval() -> bool:
+    """Run EVAL_QUESTIONS through the graph and print expected vs actual
+    verdicts. Returns True if every verdict matched."""
+    rows = []
+    for expected, question in EVAL_QUESTIONS:
+        print(f"\n>>> [{expected}] {question}")
+        result = run_crag(question)
+        ok = result["verdict"] == expected
+        rows.append((ok, expected, result["verdict"], question))
+        print(f"    verdict: {result['verdict']} ({'match' if ok else 'MISMATCH'})"
+              f"  scores: {[round(d['score'], 2) for d in result['doc_scores']]}")
+        if result["web_query"]:
+            print(f"    web query: {result['web_query']}")
+        print(f"    answer: {result['answer'][:200].replace(chr(10), ' ')}...")
+
+    print("\n=== EVAL SUMMARY ===")
+    for ok, expected, actual, question in rows:
+        print(f"  {'PASS' if ok else 'FAIL'}  expected {expected:<9} got {actual:<9} {question}")
+    passed = sum(ok for ok, *_ in rows)
+    print(f"  {passed}/{len(rows)} verdicts matched")
+    return passed == len(rows)
+
+
 # =============================================================================
 # 8. CLI
 # =============================================================================
@@ -733,6 +769,8 @@ def main() -> None:
     p_ask = sub.add_parser("ask", help="Ask a question")
     p_ask.add_argument("question")
 
+    sub.add_parser("eval", help="Run 3 sample questions (CORRECT/INCORRECT/AMBIGUOUS)")
+
     args = parser.parse_args()
     setup_logging(logging.DEBUG if args.verbose else logging.INFO)
     try:
@@ -740,6 +778,8 @@ def main() -> None:
             ingest(force=args.force, max_pages=args.max_pages, namespace=args.namespace)
         elif args.cmd == "ask":
             print_result(run_crag(args.question))
+        elif args.cmd == "eval":
+            sys.exit(0 if run_eval() else 1)
     except CRAGError as e:
         print(f"\nError: {e}", file=sys.stderr)
         sys.exit(1)
