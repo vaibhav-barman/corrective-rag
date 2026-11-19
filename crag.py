@@ -482,11 +482,30 @@ def recompose(strips: list[dict]) -> str:
 
 
 def refine(state: CRAGState) -> CRAGState:
-    """Decompose -> filter -> recompose the evaluator-approved chunks
-    plus any web results."""
-    strips = decompose(state.get("good_docs", []) + state.get("web_docs", []))
-    kept = filter_strips(state["question"], strips)
-    return {"strips": strips, "kept_strips": kept, "refined_context": recompose(kept)}
+    """Decompose -> filter -> recompose, separately for internal and web docs,
+    then merge the two contexts (CampusX stage 6):
+      CORRECT   -> internal good_docs only
+      INCORRECT -> web_docs only
+      AMBIGUOUS -> internal good_docs + web_docs, as two labelled sections
+    Both sources are filtered in one llm_batch to save round trips."""
+    internal = state.get("good_docs", []) if state.get("verdict") != "INCORRECT" else []
+    web = state.get("web_docs", [])
+    internal_strips, web_strips = decompose(internal), decompose(web)
+    kept = filter_strips(state["question"], internal_strips + web_strips)
+
+    web_sources = {doc_label(d) for d in web}
+    kept_internal = [s for s in kept if s["source"] not in web_sources]
+    kept_web = [s for s in kept if s["source"] in web_sources]
+    sections = []
+    if kept_internal:
+        sections.append("### Internal knowledge (PDFs)\n" + recompose(kept_internal))
+    if kept_web:
+        sections.append("### Web knowledge\n" + recompose(kept_web))
+    return {
+        "strips": internal_strips + web_strips,
+        "kept_strips": kept,
+        "refined_context": "\n\n".join(sections),
+    }
 
 
 # --- Stage 4: web search fallback ---------------------------------------------
@@ -542,15 +561,19 @@ def rewrite_query(state: CRAGState) -> CRAGState:
 
 
 def route_after_eval(state: CRAGState) -> str:
-    """INCORRECT -> rewrite the query for the web; otherwise refine internal docs."""
-    return "rewrite_query" if state["verdict"] == "INCORRECT" else "refine"
+    """Three-way CRAG routing after the evaluator:
+    CORRECT -> refine internal docs; INCORRECT / AMBIGUOUS -> also search the web."""
+    return "refine" if state["verdict"] == "CORRECT" else "rewrite_query"
 
 
 ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     ("You are a helpful assistant. Answer ONLY from the context below. "
-     "If the context is insufficient, say so plainly instead of guessing. "
-     "Cite sources inline using the bracketed labels, e.g. [ida.pdf p.12].")),
+     ("You are a helpful assistant. Answer ONLY from the context below; do not "
+      "use outside knowledge. The context may contain an 'Internal knowledge "
+      "(PDFs)' section and a 'Web knowledge' section: combine them, and if they "
+      "disagree, say so. If the context is insufficient, say so plainly instead "
+      "of guessing. Cite sources inline using the bracketed labels, e.g. "
+      "[ida.pdf p.12] or [https://...], and end with a short 'Sources:' list.")),
     ("human", "Question: {question}\n\nContext:\n{context}"),
 ])
 
