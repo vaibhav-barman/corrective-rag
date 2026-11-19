@@ -614,9 +614,10 @@ def build_graph():
     return g.compile()
 
 
-def run_crag(question: str) -> dict:
-    """Run the graph and return what the CLI / UI need."""
-    state = build_graph().invoke({"question": question})
+def run_crag(question: str, graph=None) -> dict:
+    """Run the graph and return what the CLI / UI need.
+    `graph` lets the Streamlit app pass in its cached compiled graph."""
+    state = (graph or build_graph()).invoke({"question": question})
     return {
         "answer": state.get("answer", ""),
         "verdict": state.get("verdict", ""),
