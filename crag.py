@@ -514,9 +514,36 @@ def web_search(state: CRAGState) -> CRAGState:
     return {"web_query": query, "web_docs": web_docs}
 
 
+# --- Stage 5: query rewriting for web search ----------------------------------
+
+
+class WebQuery(BaseModel):
+    """A search-engine-friendly rewrite of the user's question."""
+
+    query: str = Field(description="Short keyword-style web search query (max ~10 words)")
+
+
+REWRITE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Rewrite the user's question into a short, keyword-style web search query. "
+     "Keep names, versions, dates and technical terms; drop filler words. "
+     "Add a recency hint such as 'latest' only if the question asks about "
+     "recent events. Return only the query."),
+    ("human", "{question}"),
+])
+
+
+def rewrite_query(state: CRAGState) -> CRAGState:
+    """Turn the question into a concise web search query."""
+    result: WebQuery = llm_invoke(
+        REWRITE_PROMPT | structured_llm(WebQuery), {"question": state["question"]}
+    )
+    return {"web_query": result.query.strip() or state["question"]}
+
+
 def route_after_eval(state: CRAGState) -> str:
-    """INCORRECT -> go to the web; otherwise refine the internal docs."""
-    return "web_search" if state["verdict"] == "INCORRECT" else "refine"
+    """INCORRECT -> rewrite the query for the web; otherwise refine internal docs."""
+    return "rewrite_query" if state["verdict"] == "INCORRECT" else "refine"
 
 
 ANSWER_PROMPT = ChatPromptTemplate.from_messages([
@@ -548,14 +575,16 @@ def build_graph():
     g = StateGraph(CRAGState)
     g.add_node("retrieve", retrieve)
     g.add_node("eval_each_doc", eval_each_doc)
+    g.add_node("rewrite_query", rewrite_query)
     g.add_node("web_search", web_search)
     g.add_node("refine", refine)
     g.add_node("generate", generate)
     g.add_edge(START, "retrieve")
     g.add_edge("retrieve", "eval_each_doc")
     g.add_conditional_edges(
-        "eval_each_doc", route_after_eval, {"web_search": "web_search", "refine": "refine"}
+        "eval_each_doc", route_after_eval, {"rewrite_query": "rewrite_query", "refine": "refine"}
     )
+    g.add_edge("rewrite_query", "web_search")
     g.add_edge("web_search", "refine")
     g.add_edge("refine", "generate")
     g.add_edge("generate", END)
