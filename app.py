@@ -9,6 +9,8 @@ import streamlit as st
 
 import crag
 
+crag.setup_logging()
+
 VERDICT_COLORS = {"CORRECT": "green", "AMBIGUOUS": "orange", "INCORRECT": "red"}
 
 st.set_page_config(page_title="Corrective RAG", page_icon="📚")
@@ -62,7 +64,9 @@ with st.sidebar:
             try:
                 n = crag.ingest()  # idempotent: skips if the namespace is filled
                 st.success(f"Namespace ready: {n} chunks.")
-            except (Exception, SystemExit) as e:
+            except crag.CRAGError as e:
+                st.error(str(e))
+            except Exception as e:
                 st.error(f"Ingest failed: {e}")
     if st.button("Clear chat", width="stretch"):
         st.session_state.messages = []
@@ -94,5 +98,7 @@ if question := st.chat_input("Ask a question..."):
             st.session_state.messages.append(
                 {"role": "assistant", "content": result["answer"], "result": result}
             )
-        except (Exception, SystemExit) as e:
+        except crag.CRAGError as e:  # missing key, Ollama down, Gemini overloaded...
+            st.error(str(e))
+        except Exception as e:
             st.error(f"Something went wrong: {e}")

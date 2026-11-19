@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import os
 import random
 import re
@@ -22,16 +23,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TypedDict
 
-from dotenv import load_dotenv
-
 # langchain-community is being sunset (no standalone PDF-loader package exists
-# yet), so PyPDFLoader still comes from it. Silence its import-time notice.
-warnings.filterwarnings("ignore", message=".*langchain-community.*sunset.*")
-from langchain_community.document_loaders import PyPDFLoader
-
+# yet), so PyPDFLoader still comes from it; silence its import-time notice.
 # Gemini 3.x Flash-Lite ignores temperature and warns on every call; we still
 # pass temperature=0 for models that honour it, so hide the repeated notice.
+warnings.filterwarnings("ignore", message=".*langchain-community.*sunset.*")
 warnings.filterwarnings("ignore", message=".*uses fixed sampling defaults.*")
+
+from dotenv import load_dotenv
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.prompts import ChatPromptTemplate
@@ -39,13 +39,15 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import OllamaEmbeddings
 from langchain_pinecone import PineconeVectorStore
 
-# TavilySearch from langchain-tavily replaces the deprecated
+# TavilySearch (langchain-tavily) replaces the deprecated
 # langchain_community.tools.TavilySearchResults used in the CampusX notebooks.
 from langchain_tavily import TavilySearch
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
 from pinecone import Pinecone, ServerlessSpec
 from pydantic import BaseModel, Field
+
+log = logging.getLogger("crag")
 
 # =============================================================================
 # 1. CONFIG
@@ -66,10 +68,12 @@ DEFAULT_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "books")
 
 # Embeddings (local, via Ollama)
 EMBED_MODEL = "nomic-embed-text:latest"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # LLM. Override with GEMINI_MODEL / GEMINI_FALLBACK_MODEL in .env if needed.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash")
+GEMINI_MAX_ATTEMPTS = int(os.getenv("GEMINI_MAX_ATTEMPTS", "6"))
 
 # Chunking / retrieval
 CHUNK_SIZE = 900
@@ -88,11 +92,23 @@ MIN_STRIP_CHARS = 20
 WEB_MAX_RESULTS = 5
 
 
+class CRAGError(RuntimeError):
+    """A problem the user can fix (missing key, Ollama down, ...).
+    The CLI and the UI show its message without a traceback."""
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """Short '[crag] ...' log lines; keep chatty HTTP libraries quiet."""
+    logging.basicConfig(level=level, format="[%(name)s] %(message)s")
+    for noisy in ("httpx", "httpx2", "httpcore", "httpcore2", "pinecone", "google_genai", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def require_env(name: str) -> str:
-    """Return an env var or exit with a clear message (never prints the value)."""
+    """Return an env var or raise a clear error (never logs the value)."""
     value = os.getenv(name, "").strip()
     if not value:
-        sys.exit(f"[config] {name} is missing. Add it to .env (see .env.example).")
+        raise CRAGError(f"{name} is missing. Add it to .env (see .env.example).")
     return value
 
 
@@ -113,9 +129,7 @@ def _chat_model(model: str) -> ChatGoogleGenerativeAI:
 
 def get_llm():
     """Flash-Lite, falling back to Flash if the primary call errors."""
-    return _chat_model(GEMINI_MODEL).with_fallbacks(
-        [_chat_model(GEMINI_FALLBACK_MODEL)]
-    )
+    return _chat_model(GEMINI_MODEL).with_fallbacks([_chat_model(GEMINI_FALLBACK_MODEL)])
 
 
 def structured_llm(schema: type):
@@ -128,9 +142,10 @@ def structured_llm(schema: type):
 
 # --- Retry with exponential backoff for rate limits / overload ---------------
 
-GEMINI_MAX_ATTEMPTS = int(os.getenv("GEMINI_MAX_ATTEMPTS", "6"))
 _RETRYABLE = ("429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "503", "UNAVAILABLE",
-              "504", "DEADLINE_EXCEEDED", "timed out", "Timeout", "EmptyLLMOutput")
+              "504", "DEADLINE_EXCEEDED", "timed out", "Timeout", "EmptyLLMOutput",
+              "RemoteProtocolError", "ReadError", "ConnectError", "disconnected")
+_BAD_KEY = ("API_KEY_INVALID", "API key not valid", "PERMISSION_DENIED", "401")
 
 
 class EmptyLLMOutput(Exception):
@@ -140,6 +155,11 @@ class EmptyLLMOutput(Exception):
 def _is_retryable(exc: BaseException) -> bool:
     text = f"{type(exc).__name__} {exc}"
     return any(marker in text for marker in _RETRYABLE)
+
+
+def _short(exc: BaseException) -> str:
+    """First line of an API error, without the JSON payload."""
+    return str(exc).split("{")[0].strip()[:100]
 
 
 def llm_batch(chain, inputs: list[dict], max_concurrency: int = 4) -> list:
@@ -154,11 +174,14 @@ def llm_batch(chain, inputs: list[dict], max_concurrency: int = 4) -> list:
             config={"max_concurrency": max_concurrency},
             return_exceptions=True,
         )
-        failed, last_error = [], None
+        failed: list[int] = []
+        last_error: BaseException | None = None
         for i, out in zip(pending, outs):
             if out is None:
                 out = EmptyLLMOutput("model returned no structured output")
             if isinstance(out, Exception):
+                if any(m in str(out) for m in _BAD_KEY):
+                    raise CRAGError("Gemini rejected GEMINI_API_KEY; check the key in .env.") from out
                 if not _is_retryable(out):
                     raise out
                 failed.append(i)
@@ -168,11 +191,13 @@ def llm_batch(chain, inputs: list[dict], max_concurrency: int = 4) -> list:
         if not failed:
             return results
         if attempt == GEMINI_MAX_ATTEMPTS:
-            raise last_error
-        wait = min(60.0, 2.0 ** attempt) + random.uniform(0, 1)
-        short = str(last_error).split("{")[0].strip()[:80]
-        print(f"[gemini] {len(failed)} call(s) failed ({short}); "
-              f"retry {attempt}/{GEMINI_MAX_ATTEMPTS - 1} in {wait:.0f}s", file=sys.stderr)
+            raise CRAGError(
+                f"Gemini still failing after {GEMINI_MAX_ATTEMPTS} attempts "
+                f"({_short(last_error)}). The API may be overloaded; try again later."
+            ) from last_error
+        wait = min(60.0, 2.0**attempt) + random.uniform(0, 1)
+        log.warning("gemini: %d call(s) failed (%s); retry %d/%d in %.0fs",
+                    len(failed), _short(last_error), attempt, GEMINI_MAX_ATTEMPTS - 1, wait)
         time.sleep(wait)
         pending = failed
     return results
@@ -195,13 +220,31 @@ class NomicEmbeddings(Embeddings):
     always consistent between ingest and retrieval."""
 
     def __init__(self, model: str = EMBED_MODEL) -> None:
-        self._inner = OllamaEmbeddings(model=model)
+        self._inner = OllamaEmbeddings(model=model, base_url=OLLAMA_BASE_URL)
+
+    @staticmethod
+    def _friendly(exc: Exception) -> CRAGError | None:
+        """Translate common Ollama failures into actionable messages."""
+        text = str(exc).lower()
+        if "not found" in text and "model" in text:
+            return CRAGError(f"Ollama model '{EMBED_MODEL}' is not available. "
+                             f"Run: ollama pull {EMBED_MODEL}")
+        if isinstance(exc, ConnectionError) or "connect" in text or "refused" in text:
+            return CRAGError(f"Cannot reach Ollama at {OLLAMA_BASE_URL}. "
+                             "Start it (open the Ollama app or run `ollama serve`).")
+        return None
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._inner.embed_documents([f"search_document: {t}" for t in texts])
+        try:
+            return self._inner.embed_documents([f"search_document: {t}" for t in texts])
+        except Exception as e:
+            raise (self._friendly(e) or e) from e
 
     def embed_query(self, text: str) -> list[float]:
-        return self._inner.embed_query(f"search_query: {text}")
+        try:
+            return self._inner.embed_query(f"search_query: {text}")
+        except Exception as e:
+            raise (self._friendly(e) or e) from e
 
 
 # =============================================================================
@@ -220,8 +263,14 @@ def ensure_index(timeout_s: int = 120):
     """Create the serverless index if it does not exist, wait until ready,
     and return an Index handle."""
     pc = get_pinecone()
-    if not pc.has_index(INDEX_NAME):
-        print(f"[pinecone] creating index '{INDEX_NAME}' ({EMBED_DIM}d, {METRIC})")
+    try:
+        exists = pc.has_index(INDEX_NAME)
+    except Exception as e:
+        if "401" in str(e) or "unauthorized" in str(e).lower():
+            raise CRAGError("Pinecone rejected PINECONE_API_KEY; check the key in .env.") from e
+        raise CRAGError(f"Could not reach Pinecone: {_short(e)}") from e
+    if not exists:
+        log.info("pinecone: creating index '%s' (%dd, %s)", INDEX_NAME, EMBED_DIM, METRIC)
         pc.create_index(
             name=INDEX_NAME,
             dimension=EMBED_DIM,
@@ -231,7 +280,8 @@ def ensure_index(timeout_s: int = 120):
     deadline = time.time() + timeout_s
     while not pc.describe_index(INDEX_NAME).status["ready"]:
         if time.time() > deadline:
-            sys.exit(f"[pinecone] index '{INDEX_NAME}' not ready after {timeout_s}s.")
+            raise CRAGError(f"Pinecone index '{INDEX_NAME}' is not ready after {timeout_s}s; "
+                            "try again in a minute.")
         time.sleep(2)
     return pc.Index(INDEX_NAME)
 
@@ -239,9 +289,8 @@ def ensure_index(timeout_s: int = 120):
 @lru_cache(maxsize=4)
 def get_vectorstore(namespace: str = DEFAULT_NAMESPACE) -> PineconeVectorStore:
     """Read-side vector store (cached: one index check per process)."""
-    return PineconeVectorStore(
-        index=ensure_index(), embedding=NomicEmbeddings(), namespace=namespace
-    )
+    return PineconeVectorStore(index=ensure_index(), embedding=NomicEmbeddings(),
+                               namespace=namespace)
 
 
 def namespace_count(index, namespace: str) -> int:
@@ -258,8 +307,11 @@ def namespace_count(index, namespace: str) -> int:
 def load_pdfs(max_pages: int | None = None) -> list[Document]:
     """Load every PDF in documents/. Keep only clean `source` and `page`
     metadata (PyPDFLoader adds many fields, some of which Pinecone rejects)."""
+    pdfs = sorted(DOCS_DIR.glob("*.pdf"))
+    if not pdfs:
+        raise CRAGError(f"No PDFs found in {DOCS_DIR}.")
     pages: list[Document] = []
-    for pdf in sorted(DOCS_DIR.glob("*.pdf")):
+    for pdf in pdfs:
         for i, page in enumerate(PyPDFLoader(str(pdf)).lazy_load()):
             if max_pages is not None and i >= max_pages:
                 break
@@ -270,7 +322,7 @@ def load_pdfs(max_pages: int | None = None) -> list[Document]:
                 "page": int(page.metadata.get("page", i)) + 1,  # 1-based
             }
             pages.append(page)
-        print(f"[ingest] loaded {pdf.name}")
+        log.info("ingest: loaded %s", pdf.name)
     return pages
 
 
@@ -291,28 +343,24 @@ def ingest(
     index = ensure_index()
     existing = namespace_count(index, namespace)
     if existing and not force:
-        print(f"[ingest] namespace '{namespace}' already has {existing} vectors; "
-              "skipping (use --force to rebuild).")
+        log.info("ingest: namespace '%s' already has %d vectors; skipping "
+                 "(use --force to rebuild).", namespace, existing)
         return existing
     if existing and force:
-        print(f"[ingest] --force: clearing namespace '{namespace}'")
+        log.info("ingest: --force, clearing namespace '%s'", namespace)
         index.delete(delete_all=True, namespace=namespace)
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-    )
+    NomicEmbeddings().embed_query("ping")  # fail fast if Ollama is down
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     chunks = splitter.split_documents(load_pdfs(max_pages))
     ids = [chunk_id(c, n) for n, c in enumerate(chunks)]
-    print(f"[ingest] {len(chunks)} chunks -> namespace '{namespace}'")
+    log.info("ingest: %d chunks -> namespace '%s'", len(chunks), namespace)
 
-    store = PineconeVectorStore(
-        index=index, embedding=NomicEmbeddings(), namespace=namespace
-    )
+    store = PineconeVectorStore(index=index, embedding=NomicEmbeddings(), namespace=namespace)
     for start in range(0, len(chunks), batch_size):
-        store.add_documents(
-            chunks[start : start + batch_size], ids=ids[start : start + batch_size]
-        )
-        print(f"[ingest] upserted {min(start + batch_size, len(chunks))}/{len(chunks)}")
+        end = start + batch_size
+        store.add_documents(chunks[start:end], ids=ids[start:end])
+        log.info("ingest: upserted %d/%d", min(end, len(chunks)), len(chunks))
     return len(chunks)
 
 
@@ -351,13 +399,13 @@ def doc_label(doc: Document) -> str:
     return f"{md.get('source', '?')} p.{page}"
 
 
-def format_docs(docs: list[Document]) -> str:
-    return "\n\n".join(f"[{doc_label(d)}]\n{d.page_content}" for d in docs)
+# --- Stage 1: retrieve --------------------------------------------------------
 
 
 def retrieve(state: CRAGState) -> CRAGState:
-    """Stage 1: top-k similarity search in Pinecone."""
+    """Top-k similarity search in Pinecone."""
     docs = get_vectorstore().similarity_search(state["question"], k=TOP_K)
+    log.info("retrieve: %d chunks", len(docs))
     return {"docs": docs}
 
 
@@ -372,14 +420,15 @@ class DocEvalScore(BaseModel):
 
 
 DOC_EVAL_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a strict retrieval evaluator for a RAG system. Given a question "
-     "and ONE retrieved chunk, rate how useful the chunk is for answering the "
-     "question with a score from 0.0 to 1.0.\n"
-     "1.0 = the chunk directly answers the question or contains the key facts.\n"
-     "0.5 = on the right topic but only partially helpful.\n"
-     "0.0 = unrelated to the question.\n"
-     "Judge only what is in the chunk; do not use outside knowledge."),
+    ("system", (
+        "You are a strict retrieval evaluator for a RAG system. Given a question "
+        "and ONE retrieved chunk, rate how useful the chunk is for answering the "
+        "question with a score from 0.0 to 1.0.\n"
+        "1.0 = the chunk directly answers the question or contains the key facts.\n"
+        "0.5 = on the right topic but only partially helpful.\n"
+        "0.0 = unrelated to the question.\n"
+        "Judge only what is in the chunk; do not use outside knowledge."
+    )),
     ("human", "Question: {question}\n\nChunk:\n{chunk}"),
 ])
 
@@ -410,6 +459,7 @@ def eval_each_doc(state: CRAGState) -> CRAGState:
         verdict = "AMBIGUOUS"
         good = [d for d, s in zip(docs, scores) if s > LOWER_TH]
         reason = f"No chunk above {UPPER_TH}, but {len(good)} above {LOWER_TH}."
+    log.info("eval: scores=%s -> %s", [round(s, 2) for s in scores], verdict)
     return {"doc_scores": doc_scores, "good_docs": good, "verdict": verdict, "reason": reason}
 
 
@@ -428,11 +478,12 @@ class StripFilter(BaseModel):
 
 
 STRIP_FILTER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You filter context for a RAG system. For EACH numbered sentence strip, "
-     "decide keep=true only if it contains information that helps answer the "
-     "question (facts, definitions, steps, examples). Drop boilerplate, "
-     "headers, references and off-topic text. Return one decision per strip."),
+    ("system", (
+        "You filter context for a RAG system. For EACH numbered sentence strip, "
+        "decide keep=true only if it contains information that helps answer the "
+        "question (facts, definitions, steps, examples). Drop boilerplate, "
+        "headers, references and off-topic text. Return one decision per strip."
+    )),
     ("human", "Question: {question}\n\nStrips:\n{strips}"),
 ])
 
@@ -459,9 +510,7 @@ def filter_strips(question: str, strips: list[dict]) -> list[dict]:
          "strips": "\n".join(f"[{i}] {s['text']}" for i, s in enumerate(batch))}
         for batch in batches
     ]
-    results: list[StripFilter] = llm_batch(
-        STRIP_FILTER_PROMPT | structured_llm(StripFilter), inputs
-    )
+    results: list[StripFilter] = llm_batch(STRIP_FILTER_PROMPT | structured_llm(StripFilter), inputs)
     kept: list[dict] = []
     for batch, result in zip(batches, results):
         keep_idx = {d.index for d in result.decisions if d.keep}
@@ -501,6 +550,8 @@ def refine(state: CRAGState) -> CRAGState:
         sections.append("### Internal knowledge (PDFs)\n" + recompose(kept_internal))
     if kept_web:
         sections.append("### Web knowledge\n" + recompose(kept_web))
+    log.info("refine: kept %d/%d strips (internal %d, web %d)", len(kept),
+             len(internal_strips) + len(web_strips), len(kept_internal), len(kept_web))
     return {
         "strips": internal_strips + web_strips,
         "kept_strips": kept,
@@ -518,9 +569,18 @@ def get_tavily() -> TavilySearch:
 
 
 def web_search(state: CRAGState) -> CRAGState:
-    """Search the web with Tavily and wrap each hit as a Document with its URL."""
+    """Search the web with Tavily and wrap each hit as a Document with its URL.
+    A failed search degrades gracefully to 'no web results'."""
     query = state.get("web_query") or state["question"]
-    response = get_tavily().invoke({"query": query})
+    try:
+        response = get_tavily().invoke({"query": query})
+    except CRAGError:
+        raise
+    except Exception as e:
+        log.warning("web_search: Tavily failed (%s); continuing without web results", _short(e))
+        response = {}
+    if isinstance(response, dict) and response.get("error"):
+        log.warning("web_search: Tavily error: %s", response["error"])
     results = response.get("results", []) if isinstance(response, dict) else []
     web_docs = [
         Document(
@@ -530,6 +590,7 @@ def web_search(state: CRAGState) -> CRAGState:
         for r in results
         if r.get("url")
     ]
+    log.info("web_search: %d results for %r", len(web_docs), query)
     return {"web_query": query, "web_docs": web_docs}
 
 
@@ -543,11 +604,12 @@ class WebQuery(BaseModel):
 
 
 REWRITE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "Rewrite the user's question into a short, keyword-style web search query. "
-     "Keep names, versions, dates and technical terms; drop filler words. "
-     "Add a recency hint such as 'latest' only if the question asks about "
-     "recent events. Return only the query."),
+    ("system", (
+        "Rewrite the user's question into a short, keyword-style web search query. "
+        "Keep names, versions, dates and technical terms; drop filler words. "
+        "Add a recency hint such as 'latest' only if the question asks about "
+        "recent events. Return only the query."
+    )),
     ("human", "{question}"),
 ])
 
@@ -557,7 +619,12 @@ def rewrite_query(state: CRAGState) -> CRAGState:
     result: WebQuery = llm_invoke(
         REWRITE_PROMPT | structured_llm(WebQuery), {"question": state["question"]}
     )
-    return {"web_query": result.query.strip() or state["question"]}
+    query = result.query.strip() or state["question"]
+    log.info("rewrite_query: %r", query)
+    return {"web_query": query}
+
+
+# --- Stage 6: routing (CORRECT / INCORRECT / AMBIGUOUS) + generation ----------
 
 
 def route_after_eval(state: CRAGState) -> str:
@@ -567,13 +634,14 @@ def route_after_eval(state: CRAGState) -> str:
 
 
 ANSWER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     ("You are a helpful assistant. Answer ONLY from the context below; do not "
-      "use outside knowledge. The context may contain an 'Internal knowledge "
-      "(PDFs)' section and a 'Web knowledge' section: combine them, and if they "
-      "disagree, say so. If the context is insufficient, say so plainly instead "
-      "of guessing. Cite sources inline using the bracketed labels, e.g. "
-      "[ida.pdf p.12] or [https://...], and end with a short 'Sources:' list.")),
+    ("system", (
+        "You are a helpful assistant. Answer ONLY from the context below; do not "
+        "use outside knowledge. The context may contain an 'Internal knowledge "
+        "(PDFs)' section and a 'Web knowledge' section: combine them, and if they "
+        "disagree, say so. If the context is insufficient, say so plainly instead "
+        "of guessing. Cite sources inline using the bracketed labels, e.g. "
+        "[ida.pdf p.12] or [https://...], and end with a short 'Sources:' list."
+    )),
     ("human", "Question: {question}\n\nContext:\n{context}"),
 ])
 
@@ -595,6 +663,9 @@ def generate(state: CRAGState) -> CRAGState:
 
 @lru_cache(maxsize=1)
 def build_graph():
+    """retrieve -> eval_each_doc -> [CORRECT] refine -> generate
+                                  -> [INCORRECT|AMBIGUOUS] rewrite_query -> web_search
+                                     -> refine -> generate"""
     g = StateGraph(CRAGState)
     g.add_node("retrieve", retrieve)
     g.add_node("eval_each_doc", eval_each_doc)
@@ -650,6 +721,7 @@ def print_result(result: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Corrective RAG (CRAG)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_ing = sub.add_parser("ingest", help="Load, chunk, embed and upsert the PDFs")
@@ -662,10 +734,17 @@ def main() -> None:
     p_ask.add_argument("question")
 
     args = parser.parse_args()
-    if args.cmd == "ingest":
-        ingest(force=args.force, max_pages=args.max_pages, namespace=args.namespace)
-    elif args.cmd == "ask":
-        print_result(run_crag(args.question))
+    setup_logging(logging.DEBUG if args.verbose else logging.INFO)
+    try:
+        if args.cmd == "ingest":
+            ingest(force=args.force, max_pages=args.max_pages, namespace=args.namespace)
+        elif args.cmd == "ask":
+            print_result(run_crag(args.question))
+    except CRAGError as e:
+        print(f"\nError: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 if __name__ == "__main__":
