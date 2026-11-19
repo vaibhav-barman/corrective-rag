@@ -1,14 +1,3 @@
-"""Corrective RAG (CRAG) in one file.
-
-A clean re-implementation of the CampusX corrective-rag notebooks using the
-current LangChain / LangGraph / Pinecone / Tavily APIs.
-
-Usage:
-    uv run crag.py ingest [--force] [--max-pages N] [--namespace NS]
-    uv run crag.py ask "your question"
-    uv run crag.py eval
-"""
-
 from __future__ import annotations
 
 import argparse
