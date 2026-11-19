@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import sys
 import time
 import warnings
@@ -73,6 +74,10 @@ TOP_K = 4
 # Retrieval-evaluator thresholds (CampusX stage 3)
 UPPER_TH = 0.7  # any doc above this  -> CORRECT
 LOWER_TH = 0.3  # all docs below this -> INCORRECT; otherwise AMBIGUOUS
+
+# Refinement: how many sentence strips the LLM judges per call
+STRIP_BATCH = 20
+MIN_STRIP_CHARS = 20
 
 
 def require_env(name: str) -> str:
@@ -256,6 +261,9 @@ class CRAGState(TypedDict, total=False):
     good_docs: list[Document]  # chunks that passed the evaluator
     verdict: str  # CORRECT | INCORRECT | AMBIGUOUS
     reason: str  # why that verdict
+    strips: list[dict]  # decomposed sentences: {"text", "source"}
+    kept_strips: list[dict]  # strips the filter kept
+    refined_context: str  # recomposed context passed to generate
     answer: str
 
 
@@ -337,6 +345,81 @@ def eval_each_doc(state: CRAGState) -> CRAGState:
     return {"doc_scores": doc_scores, "good_docs": good, "verdict": verdict, "reason": reason}
 
 
+# --- Stage 2: retrieval refinement (decompose -> filter -> recompose) ---------
+
+
+class StripDecision(BaseModel):
+    index: int = Field(description="The number shown in brackets before the strip")
+    keep: bool = Field(description="True if the strip helps answer the question")
+
+
+class StripFilter(BaseModel):
+    """Keep/drop decision for each strip in one batch."""
+
+    decisions: list[StripDecision]
+
+
+STRIP_FILTER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You filter context for a RAG system. For EACH numbered sentence strip, "
+     "decide keep=true only if it contains information that helps answer the "
+     "question (facts, definitions, steps, examples). Drop boilerplate, "
+     "headers, references and off-topic text. Return one decision per strip."),
+    ("human", "Question: {question}\n\nStrips:\n{strips}"),
+])
+
+
+def decompose(docs: list[Document]) -> list[dict]:
+    """Split documents into sentence-level strips, each tagged with its source."""
+    strips: list[dict] = []
+    for d in docs:
+        text = re.sub(r"\s+", " ", d.page_content).strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text):
+            if len(sentence) >= MIN_STRIP_CHARS:
+                strips.append({"text": sentence, "source": doc_label(d)})
+    return strips
+
+
+def filter_strips(question: str, strips: list[dict]) -> list[dict]:
+    """Ask the LLM which strips to keep, STRIP_BATCH strips per call.
+    Strips the model does not mention are dropped (conservative filter)."""
+    if not strips:
+        return []
+    batches = [strips[i : i + STRIP_BATCH] for i in range(0, len(strips), STRIP_BATCH)]
+    inputs = [
+        {"question": question,
+         "strips": "\n".join(f"[{i}] {s['text']}" for i, s in enumerate(batch))}
+        for batch in batches
+    ]
+    results: list[StripFilter] = (STRIP_FILTER_PROMPT | structured_llm(StripFilter)).batch(
+        inputs, config={"max_concurrency": 4}
+    )
+    kept: list[dict] = []
+    for batch, result in zip(batches, results):
+        keep_idx = {d.index for d in result.decisions if d.keep}
+        kept.extend(s for i, s in enumerate(batch) if i in keep_idx)
+    return kept
+
+
+def recompose(strips: list[dict]) -> str:
+    """Join kept strips back into text, grouping consecutive strips that share
+    a source under one citation label."""
+    parts: list[str] = []
+    for s in strips:
+        if parts and parts[-1].startswith(f"[{s['source']}]"):
+            parts[-1] += " " + s["text"]
+        else:
+            parts.append(f"[{s['source']}] {s['text']}")
+    return "\n\n".join(parts)
+
+
+def refine(state: CRAGState) -> CRAGState:
+    """Decompose -> filter -> recompose the evaluator-approved chunks."""
+    strips = decompose(state.get("good_docs", []))
+    kept = filter_strips(state["question"], strips)
+    return {"strips": strips, "kept_strips": kept, "refined_context": recompose(kept)}
+
+
 ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a helpful assistant. Answer ONLY from the context below. "
@@ -347,10 +430,10 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def generate(state: CRAGState) -> CRAGState:
-    """Answer from the evaluator-approved chunks only."""
-    context = format_docs(state.get("good_docs", []))
+    """Answer from the refined context only."""
+    context = state.get("refined_context", "").strip()
     msg = (ANSWER_PROMPT | get_llm()).invoke(
-        {"question": state["question"], "context": context or "(no context)"}
+        {"question": state["question"], "context": context or "(no relevant context found)"}
     )
     return {"answer": msg.text}
 
@@ -365,10 +448,12 @@ def build_graph():
     g = StateGraph(CRAGState)
     g.add_node("retrieve", retrieve)
     g.add_node("eval_each_doc", eval_each_doc)
+    g.add_node("refine", refine)
     g.add_node("generate", generate)
     g.add_edge(START, "retrieve")
     g.add_edge("retrieve", "eval_each_doc")
-    g.add_edge("eval_each_doc", "generate")
+    g.add_edge("eval_each_doc", "refine")
+    g.add_edge("refine", "generate")
     g.add_edge("generate", END)
     return g.compile()
 
@@ -381,7 +466,10 @@ def run_crag(question: str) -> dict:
         "verdict": state.get("verdict", ""),
         "reason": state.get("reason", ""),
         "doc_scores": state.get("doc_scores", []),
-        "sources": sorted({doc_label(d) for d in state.get("good_docs", [])}),
+        "strips_total": len(state.get("strips", [])),
+        "strips_kept": len(state.get("kept_strips", [])),
+        # Sources = where the kept strips came from, i.e. what the answer used.
+        "sources": list(dict.fromkeys(s["source"] for s in state.get("kept_strips", []))),
     }
 
 
@@ -390,6 +478,7 @@ def print_result(result: dict) -> None:
     print(f"\n=== VERDICT: {result['verdict']} === {result['reason']}")
     for ds in result["doc_scores"]:
         print(f"  {ds['score']:.2f}  {ds['source']:<22} {ds['reason']}")
+    print(f"\nRefinement: kept {result['strips_kept']}/{result['strips_total']} sentence strips")
     print("\n=== ANSWER ===\n" + result["answer"])
     print("\nSources: " + (", ".join(result["sources"]) or "(none)"))
 
