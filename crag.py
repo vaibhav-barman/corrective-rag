@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import random
 import re
 import sys
 import time
@@ -37,6 +38,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import OllamaEmbeddings
 from langchain_pinecone import PineconeVectorStore
+
+# TavilySearch from langchain-tavily replaces the deprecated
+# langchain_community.tools.TavilySearchResults used in the CampusX notebooks.
+from langchain_tavily import TavilySearch
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
 from pinecone import Pinecone, ServerlessSpec
@@ -79,6 +84,9 @@ LOWER_TH = 0.3  # all docs below this -> INCORRECT; otherwise AMBIGUOUS
 STRIP_BATCH = 20
 MIN_STRIP_CHARS = 20
 
+# Web search
+WEB_MAX_RESULTS = 5
+
 
 def require_env(name: str) -> str:
     """Return an env var or exit with a clear message (never prints the value)."""
@@ -98,8 +106,8 @@ def _chat_model(model: str) -> ChatGoogleGenerativeAI:
         model=model,
         google_api_key=require_env("GEMINI_API_KEY"),
         temperature=0,
-        max_retries=2,
-        timeout=60,
+        max_retries=1,  # our own backoff below handles longer outages
+        timeout=120,
     )
 
 
@@ -116,6 +124,63 @@ def structured_llm(schema: type):
     return _chat_model(GEMINI_MODEL).with_structured_output(schema).with_fallbacks(
         [_chat_model(GEMINI_FALLBACK_MODEL).with_structured_output(schema)]
     )
+
+
+# --- Retry with exponential backoff for rate limits / overload ---------------
+
+GEMINI_MAX_ATTEMPTS = int(os.getenv("GEMINI_MAX_ATTEMPTS", "6"))
+_RETRYABLE = ("429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "503", "UNAVAILABLE",
+              "504", "DEADLINE_EXCEEDED", "timed out", "Timeout", "EmptyLLMOutput")
+
+
+class EmptyLLMOutput(Exception):
+    """Structured output came back empty (treated as retryable)."""
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}"
+    return any(marker in text for marker in _RETRYABLE)
+
+
+def llm_batch(chain, inputs: list[dict], max_concurrency: int = 4) -> list:
+    """Run `chain` over many inputs with retry + exponential backoff.
+    Only the failed items are retried, so successful calls are never repeated.
+    Non-retryable errors (bad key, bad request) are raised immediately."""
+    results: list = [None] * len(inputs)
+    pending = list(range(len(inputs)))
+    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+        outs = chain.batch(
+            [inputs[i] for i in pending],
+            config={"max_concurrency": max_concurrency},
+            return_exceptions=True,
+        )
+        failed, last_error = [], None
+        for i, out in zip(pending, outs):
+            if out is None:
+                out = EmptyLLMOutput("model returned no structured output")
+            if isinstance(out, Exception):
+                if not _is_retryable(out):
+                    raise out
+                failed.append(i)
+                last_error = out
+            else:
+                results[i] = out
+        if not failed:
+            return results
+        if attempt == GEMINI_MAX_ATTEMPTS:
+            raise last_error
+        wait = min(60.0, 2.0 ** attempt) + random.uniform(0, 1)
+        short = str(last_error).split("{")[0].strip()[:80]
+        print(f"[gemini] {len(failed)} call(s) failed ({short}); "
+              f"retry {attempt}/{GEMINI_MAX_ATTEMPTS - 1} in {wait:.0f}s", file=sys.stderr)
+        time.sleep(wait)
+        pending = failed
+    return results
+
+
+def llm_invoke(chain, inputs: dict):
+    """Single call with the same retry/backoff as llm_batch."""
+    return llm_batch(chain, [inputs], max_concurrency=1)[0]
 
 
 # =============================================================================
@@ -171,7 +236,9 @@ def ensure_index(timeout_s: int = 120):
     return pc.Index(INDEX_NAME)
 
 
+@lru_cache(maxsize=4)
 def get_vectorstore(namespace: str = DEFAULT_NAMESPACE) -> PineconeVectorStore:
+    """Read-side vector store (cached: one index check per process)."""
     return PineconeVectorStore(
         index=ensure_index(), embedding=NomicEmbeddings(), namespace=namespace
     )
@@ -261,6 +328,8 @@ class CRAGState(TypedDict, total=False):
     good_docs: list[Document]  # chunks that passed the evaluator
     verdict: str  # CORRECT | INCORRECT | AMBIGUOUS
     reason: str  # why that verdict
+    web_query: str  # query sent to Tavily
+    web_docs: list[Document]  # Tavily results as Documents (metadata: url)
     strips: list[dict]  # decomposed sentences: {"text", "source"}
     kept_strips: list[dict]  # strips the filter kept
     refined_context: str  # recomposed context passed to generate
@@ -320,9 +389,8 @@ def eval_each_doc(state: CRAGState) -> CRAGState:
     CORRECT (any > UPPER_TH), INCORRECT (all < LOWER_TH), else AMBIGUOUS."""
     docs = state.get("docs", [])
     evaluator = DOC_EVAL_PROMPT | structured_llm(DocEvalScore)
-    results: list[DocEvalScore] = evaluator.batch(
-        [{"question": state["question"], "chunk": d.page_content} for d in docs],
-        config={"max_concurrency": 4},
+    results: list[DocEvalScore] = llm_batch(
+        evaluator, [{"question": state["question"], "chunk": d.page_content} for d in docs]
     )
     scores = [min(max(r.score, 0.0), 1.0) for r in results]
     doc_scores = [
@@ -391,8 +459,8 @@ def filter_strips(question: str, strips: list[dict]) -> list[dict]:
          "strips": "\n".join(f"[{i}] {s['text']}" for i, s in enumerate(batch))}
         for batch in batches
     ]
-    results: list[StripFilter] = (STRIP_FILTER_PROMPT | structured_llm(StripFilter)).batch(
-        inputs, config={"max_concurrency": 4}
+    results: list[StripFilter] = llm_batch(
+        STRIP_FILTER_PROMPT | structured_llm(StripFilter), inputs
     )
     kept: list[dict] = []
     for batch, result in zip(batches, results):
@@ -414,17 +482,48 @@ def recompose(strips: list[dict]) -> str:
 
 
 def refine(state: CRAGState) -> CRAGState:
-    """Decompose -> filter -> recompose the evaluator-approved chunks."""
-    strips = decompose(state.get("good_docs", []))
+    """Decompose -> filter -> recompose the evaluator-approved chunks
+    plus any web results."""
+    strips = decompose(state.get("good_docs", []) + state.get("web_docs", []))
     kept = filter_strips(state["question"], strips)
     return {"strips": strips, "kept_strips": kept, "refined_context": recompose(kept)}
 
 
+# --- Stage 4: web search fallback ---------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def get_tavily() -> TavilySearch:
+    require_env("TAVILY_API_KEY")  # TavilySearch reads it from the environment
+    return TavilySearch(max_results=WEB_MAX_RESULTS)
+
+
+def web_search(state: CRAGState) -> CRAGState:
+    """Search the web with Tavily and wrap each hit as a Document with its URL."""
+    query = state.get("web_query") or state["question"]
+    response = get_tavily().invoke({"query": query})
+    results = response.get("results", []) if isinstance(response, dict) else []
+    web_docs = [
+        Document(
+            page_content=f"{r.get('title', '')}\n{r.get('content', '')}".strip(),
+            metadata={"url": r["url"], "title": r.get("title", "")},
+        )
+        for r in results
+        if r.get("url")
+    ]
+    return {"web_query": query, "web_docs": web_docs}
+
+
+def route_after_eval(state: CRAGState) -> str:
+    """INCORRECT -> go to the web; otherwise refine the internal docs."""
+    return "web_search" if state["verdict"] == "INCORRECT" else "refine"
+
+
 ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You are a helpful assistant. Answer ONLY from the context below. "
+     ("You are a helpful assistant. Answer ONLY from the context below. "
      "If the context is insufficient, say so plainly instead of guessing. "
-     "Cite sources inline using the bracketed labels, e.g. [ida.pdf p.12]."),
+     "Cite sources inline using the bracketed labels, e.g. [ida.pdf p.12].")),
     ("human", "Question: {question}\n\nContext:\n{context}"),
 ])
 
@@ -432,8 +531,9 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
 def generate(state: CRAGState) -> CRAGState:
     """Answer from the refined context only."""
     context = state.get("refined_context", "").strip()
-    msg = (ANSWER_PROMPT | get_llm()).invoke(
-        {"question": state["question"], "context": context or "(no relevant context found)"}
+    msg = llm_invoke(
+        ANSWER_PROMPT | get_llm(),
+        {"question": state["question"], "context": context or "(no relevant context found)"},
     )
     return {"answer": msg.text}
 
@@ -448,11 +548,15 @@ def build_graph():
     g = StateGraph(CRAGState)
     g.add_node("retrieve", retrieve)
     g.add_node("eval_each_doc", eval_each_doc)
+    g.add_node("web_search", web_search)
     g.add_node("refine", refine)
     g.add_node("generate", generate)
     g.add_edge(START, "retrieve")
     g.add_edge("retrieve", "eval_each_doc")
-    g.add_edge("eval_each_doc", "refine")
+    g.add_conditional_edges(
+        "eval_each_doc", route_after_eval, {"web_search": "web_search", "refine": "refine"}
+    )
+    g.add_edge("web_search", "refine")
     g.add_edge("refine", "generate")
     g.add_edge("generate", END)
     return g.compile()
@@ -466,6 +570,7 @@ def run_crag(question: str) -> dict:
         "verdict": state.get("verdict", ""),
         "reason": state.get("reason", ""),
         "doc_scores": state.get("doc_scores", []),
+        "web_query": state.get("web_query", ""),
         "strips_total": len(state.get("strips", [])),
         "strips_kept": len(state.get("kept_strips", [])),
         # Sources = where the kept strips came from, i.e. what the answer used.
@@ -478,6 +583,8 @@ def print_result(result: dict) -> None:
     print(f"\n=== VERDICT: {result['verdict']} === {result['reason']}")
     for ds in result["doc_scores"]:
         print(f"  {ds['score']:.2f}  {ds['source']:<22} {ds['reason']}")
+    if result["web_query"]:
+        print(f"\nWeb search query: {result['web_query']}")
     print(f"\nRefinement: kept {result['strips_kept']}/{result['strips_total']} sentence strips")
     print("\n=== ANSWER ===\n" + result["answer"])
     print("\nSources: " + (", ".join(result["sources"]) or "(none)"))
