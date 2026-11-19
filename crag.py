@@ -1,3 +1,14 @@
+"""Corrective RAG (CRAG) in one file.
+
+Retrieval evaluation, knowledge refinement, query rewriting and web-search
+fallback, built on LangChain / LangGraph / Pinecone / Tavily.
+
+Usage:
+    uv run crag.py ingest [--force] [--max-pages N] [--namespace NS]
+    uv run crag.py ask "your question"
+    uv run crag.py eval
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -30,7 +41,7 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_pinecone import PineconeVectorStore
 
 # TavilySearch (langchain-tavily) replaces the deprecated
-# langchain_community.tools.TavilySearchResults used in the CampusX notebooks.
+# langchain_community.tools.TavilySearchResults.
 from langchain_tavily import TavilySearch
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
@@ -70,7 +81,7 @@ CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
 TOP_K = 4
 
-# Retrieval-evaluator thresholds (CampusX stage 3)
+# Retrieval-evaluator thresholds
 UPPER_TH = 0.7  # any doc above this  -> CORRECT
 LOWER_TH = 0.3  # all docs below this -> INCORRECT; otherwise AMBIGUOUS
 
@@ -445,7 +456,7 @@ def eval_each_doc(state: CRAGState) -> CRAGState:
         verdict, good = "INCORRECT", []
         reason = f"All chunks scored below {LOWER_TH}."
     else:
-        # As in CampusX stage 6: keep the partially relevant chunks (> LOWER_TH).
+        # Keep the partially relevant chunks (> LOWER_TH) for merging with the web.
         verdict = "AMBIGUOUS"
         good = [d for d, s in zip(docs, scores) if s > LOWER_TH]
         reason = f"No chunk above {UPPER_TH}, but {len(good)} above {LOWER_TH}."
@@ -522,7 +533,7 @@ def recompose(strips: list[dict]) -> str:
 
 def refine(state: CRAGState) -> CRAGState:
     """Decompose -> filter -> recompose, separately for internal and web docs,
-    then merge the two contexts (CampusX stage 6):
+    then merge the two contexts:
       CORRECT   -> internal good_docs only
       INCORRECT -> web_docs only
       AMBIGUOUS -> internal good_docs + web_docs, as two labelled sections

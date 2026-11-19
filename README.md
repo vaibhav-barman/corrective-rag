@@ -1,9 +1,8 @@
 # Corrective RAG (CRAG)
 
 A single-file Corrective RAG pipeline over four PDF books, built with LangGraph,
-Gemini, local Ollama embeddings, Pinecone and Tavily. It re-implements the six
-CampusX [corrective-rag](https://github.com/campusx-official/corrective-rag)
-notebooks with current, non-deprecated APIs.
+Gemini, local Ollama embeddings, Pinecone and Tavily, using current,
+non-deprecated APIs.
 
 ## What is CRAG?
 
@@ -39,7 +38,7 @@ The refine step uses different inputs for each verdict: CORRECT uses the good PD
 chunks, INCORRECT uses the web results, and AMBIGUOUS uses both, merged into
 labelled *Internal knowledge* and *Web knowledge* sections.
 
-| Stage (CampusX notebook) | Where in `crag.py` |
+| Stage | Where in `crag.py` |
 |---|---|
 | 1. Basic RAG | `NomicEmbeddings`, `ensure_index`, `ingest`, `retrieve`, `generate` |
 | 2. Retrieval refinement | `decompose`, `filter_strips`, `recompose`, `refine` |
@@ -119,10 +118,9 @@ documents/     the source PDFs
   to keep a question to roughly 8–10 LLM calls.
 - **Idempotent ingest:** chunk IDs are deterministic hashes, and `ingest` skips
   a namespace that already has vectors unless you pass `--force`.
-- **Updated since the CampusX notebooks:** `TavilySearchResults` became
-  `langchain_tavily.TavilySearch`; `pinecone.init()` / `pinecone-client` became
-  the `Pinecone` client object (SDK v7); OpenAI embeddings became local
-  `nomic-embed-text`. `PyPDFLoader` still comes from `langchain-community`,
+- **Modern APIs:** the deprecated `TavilySearchResults` is replaced by
+  `langchain_tavily.TavilySearch`, and `pinecone.init()` / `pinecone-client`
+  by the `Pinecone` client object (SDK v7). `PyPDFLoader` still comes from `langchain-community`,
   which is being sunset, because no standalone replacement exists yet.
 - Gemini 3.x Flash-Lite uses fixed sampling, so `temperature=0` has no effect
   on it. It is still passed for models that honour it.
