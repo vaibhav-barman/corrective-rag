@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 # yet), so PyPDFLoader still comes from it. Silence its import-time notice.
 warnings.filterwarnings("ignore", message=".*langchain-community.*sunset.*")
 from langchain_community.document_loaders import PyPDFLoader
+
 # Gemini 3.x Flash-Lite ignores temperature and warns on every call; we still
 # pass temperature=0 for models that honour it, so hide the repeated notice.
 warnings.filterwarnings("ignore", message=".*uses fixed sampling defaults.*")
@@ -38,6 +39,7 @@ from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
 from pinecone import Pinecone, ServerlessSpec
+from pydantic import BaseModel, Field
 
 # =============================================================================
 # 1. CONFIG
@@ -67,6 +69,10 @@ GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash")
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
 TOP_K = 4
+
+# Retrieval-evaluator thresholds (CampusX stage 3)
+UPPER_TH = 0.7  # any doc above this  -> CORRECT
+LOWER_TH = 0.3  # all docs below this -> INCORRECT; otherwise AMBIGUOUS
 
 
 def require_env(name: str) -> str:
@@ -246,6 +252,10 @@ def ingest(
 class CRAGState(TypedDict, total=False):
     question: str
     docs: list[Document]  # retrieved from Pinecone
+    doc_scores: list[dict]  # per-chunk evaluator output (for the UI / CLI)
+    good_docs: list[Document]  # chunks that passed the evaluator
+    verdict: str  # CORRECT | INCORRECT | AMBIGUOUS
+    reason: str  # why that verdict
     answer: str
 
 
@@ -274,6 +284,59 @@ def retrieve(state: CRAGState) -> CRAGState:
     return {"docs": docs}
 
 
+# --- Stage 3: retrieval evaluator --------------------------------------------
+
+
+class DocEvalScore(BaseModel):
+    """Evaluator output for one retrieved chunk."""
+
+    score: float = Field(description="Relevance of the chunk to the question, from 0.0 to 1.0")
+    reason: str = Field(description="One short sentence justifying the score")
+
+
+DOC_EVAL_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a strict retrieval evaluator for a RAG system. Given a question "
+     "and ONE retrieved chunk, rate how useful the chunk is for answering the "
+     "question with a score from 0.0 to 1.0.\n"
+     "1.0 = the chunk directly answers the question or contains the key facts.\n"
+     "0.5 = on the right topic but only partially helpful.\n"
+     "0.0 = unrelated to the question.\n"
+     "Judge only what is in the chunk; do not use outside knowledge."),
+    ("human", "Question: {question}\n\nChunk:\n{chunk}"),
+])
+
+
+def eval_each_doc(state: CRAGState) -> CRAGState:
+    """Score every retrieved chunk, then decide the verdict:
+    CORRECT (any > UPPER_TH), INCORRECT (all < LOWER_TH), else AMBIGUOUS."""
+    docs = state.get("docs", [])
+    evaluator = DOC_EVAL_PROMPT | structured_llm(DocEvalScore)
+    results: list[DocEvalScore] = evaluator.batch(
+        [{"question": state["question"], "chunk": d.page_content} for d in docs],
+        config={"max_concurrency": 4},
+    )
+    scores = [min(max(r.score, 0.0), 1.0) for r in results]
+    doc_scores = [
+        {"source": doc_label(d), "score": s, "reason": r.reason}
+        for d, s, r in zip(docs, scores, results)
+    ]
+
+    if any(s > UPPER_TH for s in scores):
+        verdict = "CORRECT"
+        good = [d for d, s in zip(docs, scores) if s > UPPER_TH]
+        reason = f"{len(good)} chunk(s) scored above {UPPER_TH}."
+    elif all(s < LOWER_TH for s in scores):  # also true when nothing was retrieved
+        verdict, good = "INCORRECT", []
+        reason = f"All chunks scored below {LOWER_TH}."
+    else:
+        # As in CampusX stage 6: keep the partially relevant chunks (> LOWER_TH).
+        verdict = "AMBIGUOUS"
+        good = [d for d, s in zip(docs, scores) if s > LOWER_TH]
+        reason = f"No chunk above {UPPER_TH}, but {len(good)} above {LOWER_TH}."
+    return {"doc_scores": doc_scores, "good_docs": good, "verdict": verdict, "reason": reason}
+
+
 ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a helpful assistant. Answer ONLY from the context below. "
@@ -284,8 +347,8 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def generate(state: CRAGState) -> CRAGState:
-    """Answer from the retrieved context only."""
-    context = format_docs(state.get("docs", []))
+    """Answer from the evaluator-approved chunks only."""
+    context = format_docs(state.get("good_docs", []))
     msg = (ANSWER_PROMPT | get_llm()).invoke(
         {"question": state["question"], "context": context or "(no context)"}
     )
@@ -301,9 +364,11 @@ def generate(state: CRAGState) -> CRAGState:
 def build_graph():
     g = StateGraph(CRAGState)
     g.add_node("retrieve", retrieve)
+    g.add_node("eval_each_doc", eval_each_doc)
     g.add_node("generate", generate)
     g.add_edge(START, "retrieve")
-    g.add_edge("retrieve", "generate")
+    g.add_edge("retrieve", "eval_each_doc")
+    g.add_edge("eval_each_doc", "generate")
     g.add_edge("generate", END)
     return g.compile()
 
@@ -313,8 +378,20 @@ def run_crag(question: str) -> dict:
     state = build_graph().invoke({"question": question})
     return {
         "answer": state.get("answer", ""),
-        "sources": sorted({doc_label(d) for d in state.get("docs", [])}),
+        "verdict": state.get("verdict", ""),
+        "reason": state.get("reason", ""),
+        "doc_scores": state.get("doc_scores", []),
+        "sources": sorted({doc_label(d) for d in state.get("good_docs", [])}),
     }
+
+
+def print_result(result: dict) -> None:
+    """Pretty-print a run_crag() result for the terminal."""
+    print(f"\n=== VERDICT: {result['verdict']} === {result['reason']}")
+    for ds in result["doc_scores"]:
+        print(f"  {ds['score']:.2f}  {ds['source']:<22} {ds['reason']}")
+    print("\n=== ANSWER ===\n" + result["answer"])
+    print("\nSources: " + (", ".join(result["sources"]) or "(none)"))
 
 
 # =============================================================================
@@ -339,9 +416,7 @@ def main() -> None:
     if args.cmd == "ingest":
         ingest(force=args.force, max_pages=args.max_pages, namespace=args.namespace)
     elif args.cmd == "ask":
-        result = run_crag(args.question)
-        print("\n=== ANSWER ===\n" + result["answer"])
-        print("\nSources: " + ", ".join(result["sources"]))
+        print_result(run_crag(args.question))
 
 
 if __name__ == "__main__":
